@@ -1,50 +1,152 @@
-import bodyParser from "body-parser";
-import express from "express";
-import { BASE_NODE_PORT } from "../config";
-import { Value } from "../types";
+import bodyParser from 'body-parser';
+import express from 'express';
+import http from 'http';
+import { BASE_NODE_PORT } from '../config';
+import { NodeState, Value } from '../types';
+import { delay } from '../utils';
 
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
-) {
-  const node = express();
-  node.use(express.json());
-  node.use(bodyParser.json());
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
+): Promise<http.Server> {
+  const app = express();
+  app.use(express.json());
+  app.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  let currentState: NodeState = {
+    killed: false,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 1,
+  };
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  let proposals: Map<number, Value[]> = new Map();
+  let votes: Map<number, Value[]> = new Map();
 
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  app.get('/status', (req, res) => {
+    res.status(isFaulty ? 500 : 200).send(isFaulty ? 'faulty' : 'live');
+  });
 
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  app.get('/stop', (req, res) => {
+    // Mark the node as 'killed' and set 'decided', 'x', and 'k' to null to simulate a faulty node
+    currentState.killed = true;
+    currentState.decided = null;
+    currentState.x = null;
+    currentState.k = null;
+    res.status(200).send('Node stopped and marked as faulty');
+  });
 
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+  app.get('/getState', (req, res) => {
+    res.status(200).send(currentState);
+  });
 
-  // start the server
-  const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
-    console.log(
-      `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
-    );
+  app.get('/start', async (req, res) => {
+    while (!nodesAreReady()) await delay(5);
+    if (!isFaulty) initiateConsensus();
+    res.status(200).send('Consensus algorithm started.');
+  });
 
-    // the node is ready
+  app.post('/message', async (req, res) => {
+    if (isFaulty || currentState.killed) {
+      res.status(200).send('Message received but ignored.');
+      return;
+    }
+
+    const { k, x, messageType } = req.body;
+    if (messageType === 'propose') {
+      handleProposal(k, x);
+    } else if (messageType === 'vote') {
+      handleVote(k, x);
+    }
+
+    res.status(200).send('Message received and processed.');
+  });
+
+  const server = app.listen(BASE_NODE_PORT + nodeId, async () => {
+    console.log(`Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`);
     setNodeIsReady(nodeId);
   });
+
+  function initiateConsensus() {
+    if (currentState.k !== null && currentState.x !== null) { // Check that k and x are not null
+      broadcastMessage(currentState.k, currentState.x, 'propose');
+    }
+  }
+
+  function handleProposal(k: number, x: Value) {
+    updateMap(proposals, k, x);
+    const proposalValues = proposals.get(k);
+    if (proposalValues && proposalValues.length >= N - F) {
+      decideAndBroadcast(k, proposalValues);
+    }
+  }
+
+  function handleVote(k: number, x: Value) {
+    updateMap(votes, k, x);
+    const voteValues = votes.get(k);
+    if (voteValues && voteValues.length >= N - F) {
+      finalDecision(k, voteValues);
+    }
+  }
+
+  function updateMap(map: Map<number, Value[]>, k: number, x: Value) {
+    const values = map.get(k) || [];
+    values.push(x);
+    map.set(k, values); // Reassign to ensure update is captured
+  }
+
+  function decideAndBroadcast(k: number, proposal: Value[]) {
+    let count = countVotes(proposal);
+    let decision: Value = count[0] > N / 2 ? 0 : count[1] > N / 2 ? 1 : Math.random() > 0.5 ? 0 : 1; // Ensure decision is of type Value
+    broadcastMessage(k, decision, 'vote');
+  }
+
+  function finalDecision(k: number, vote: Value[]) {
+    let count = countVotes(vote);
+    if (count[0] >= F + 1 || count[1] >= F + 1) {
+      currentState.x = count[0] > count[1] ? 0 : 1;
+      currentState.decided = true;
+    } else {
+      currentState.k = k + 1;
+      currentState.x = Math.random() > 0.5 ? 0 : 1;
+      broadcastMessage(currentState.k, currentState.x, 'propose');
+    }
+  }
+
+  function broadcastMessage(k: number, x: Value, messageType: string) {
+    for (let i = 0; i < N; i++) {
+      sendMessage(`http://localhost:${BASE_NODE_PORT + i}/message`, { k, x, messageType });
+    }
+  }
+
+  function countVotes(array: Value[]): number[] {
+    let counts = [0, 0]; // counts[0] for 0s, counts[1] for 1s
+    array.forEach((value) => {
+      if (value !== '?') {
+        counts[value]++;
+      }
+    });
+    return counts;
+  }
+
+  function sendMessage(url: string, body: any) {
+    http.request(
+      url,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' } },
+      (res) => {
+        res.on('data', () => {}); // No need to do anything with the response
+      }
+    )
+      .on('error', (error) => {
+        console.error(error);
+      })
+      .end(JSON.stringify(body));
+  }
 
   return server;
 }
